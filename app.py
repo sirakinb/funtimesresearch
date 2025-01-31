@@ -19,7 +19,7 @@ API_KEY = "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"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 
 # Predefined Make.com webhook URL
-MAKE_WEBHOOK_URL = "https://hook.us2.make.com/q8wargi9oygw7qti14dz79yl9jh8v3sr"
+MAKE_WEBHOOK_URL = "https://hook.us2.make.com/jt9nict16gd1p893oklj5ej54hnwk824"
 
 def strip_markdown(text):
     # Remove bold/italic markdown
@@ -118,4 +118,4 @@ def send_to_make():
         return jsonify({"error": f"Failed to send to Make.com: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000, host='127.0.0.1') 
+    app.run(debug=True, port=5001, host='0.0.0.0') 
