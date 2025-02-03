@@ -12,7 +12,10 @@ import json
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Configure retry strategy
@@ -74,8 +77,12 @@ def search():
         logger.info(f"Received search query: {query} with model: {model_type}")
         
         if not query:
+            logger.error("No query provided")
             return jsonify({"error": "Query is required"}), 400
 
+        # Log API key presence (without revealing the key)
+        logger.info(f"API Key configured: {'Yes' if API_KEY else 'No'}")
+        
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {API_KEY}",
@@ -84,6 +91,7 @@ def search():
         
         # Get model configuration
         model_config = MODELS.get(model_type, MODELS['pro'])
+        logger.info(f"Using model configuration: {model_config['name']}")
         
         # Set system prompt based on model type
         system_prompt = model_config.get('system_prompt', "You are a helpful search assistant. Provide information in plain text only. Use simple paragraphs. For bullet points, use a simple dash and space. For section titles, write them in plain text followed by a colon.")
@@ -103,15 +111,20 @@ def search():
             "max_tokens": model_config['max_tokens'],
             "temperature": 0.2,
             "top_p": 0.9,
-            "stream": True  # Enable streaming
+            "stream": True
         }
 
         logger.debug(f"Sending request to Perplexity API with payload: {payload}")
         
         def generate():
             try:
+                # Log the full request details (except API key)
+                logger.info(f"Making request to: {PERPLEXITY_URL}")
+                logger.info(f"Request headers (sanitized): {{'Accept': '{headers['Accept']}', 'Content-Type': '{headers['Content-Type']}'}}")
+                
                 # Use session with retry logic and model-specific timeout
                 with http.post(PERPLEXITY_URL, headers=headers, json=payload, timeout=model_config['timeout'], stream=True) as response:
+                    logger.info(f"Initial response status: {response.status_code}")
                     response.raise_for_status()
                     
                     accumulated_text = ""
@@ -124,6 +137,7 @@ def search():
                                 try:
                                     json_str = line[6:]  # Remove 'data: ' prefix
                                     if json_str.strip() == '[DONE]':
+                                        logger.info("Stream completed successfully")
                                         break
                                     
                                     chunk = json.loads(json_str)
@@ -142,7 +156,8 @@ def search():
                                             'citations': citations if citations else []
                                         }) + '\n'
                                         
-                                except json.JSONDecodeError:
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"JSON decode error: {str(e)} for line: {line}")
                                     continue
                     
                     # Send final accumulated citations if any
@@ -153,8 +168,18 @@ def search():
                             'done': True
                         }) + '\n'
                     
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Request timeout: {str(e)}")
+                yield json.dumps({
+                    'error': 'Request timed out. Please try again.'
+                }) + '\n'
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error: {str(e)}")
+                yield json.dumps({
+                    'error': f'API request failed: {str(e)}'
+                }) + '\n'
             except Exception as e:
-                logger.error(f"Streaming error: {str(e)}")
+                logger.error(f"Unexpected streaming error: {str(e)}")
                 yield json.dumps({
                     'error': str(e)
                 }) + '\n'
@@ -162,7 +187,7 @@ def search():
         return Response(generate(), mimetype='text/event-stream')
         
     except Exception as e:
-        logger.error(f"Setup error: {str(e)}")
+        logger.error(f"Setup error: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/send-to-make', methods=['POST'])
