@@ -1,10 +1,13 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, Response
 import os
 from dotenv import load_dotenv
 import requests
 from flask_cors import CORS
 import logging
 import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import json
 
 load_dotenv()
 
@@ -12,11 +15,38 @@ load_dotenv()
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Configure retry strategy
+retry_strategy = Retry(
+    total=3,  # number of retries
+    backoff_factor=1,  # wait 1, 2, 4 seconds between retries
+    status_forcelist=[429, 500, 502, 503, 504]  # status codes to retry on
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+http = requests.Session()
+http.mount("https://", adapter)
+http.mount("http://", adapter)
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 API_KEY = "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"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
+
+# Model configurations
+MODELS = {
+    "pro": {
+        "name": "sonar-pro",  # 200k context length, 8k output limit
+        "timeout": 30,  # 30 second timeout
+        "max_tokens": 8192,
+        "system_prompt": "You are a helpful search assistant. Provide information in plain text only. Use simple paragraphs. For bullet points, use a simple dash and space. For section titles, write them in plain text followed by a colon."
+    },
+    "reasoning": {
+        "name": "sonar-reasoning",  # 127k context length, includes Chain of Thought
+        "timeout": 60,  # 60 second timeout for CoT processing
+        "max_tokens": 4096,
+        "system_prompt": "You are a helpful search assistant. First, explain your chain of thought in analyzing the query, wrapping it in <think> tags. Then, provide your final answer in a clear, organized format. Use simple paragraphs for main text. Use dashes (-) for bullet points. Use clear headings followed by a colon. Do not use markdown formatting."
+    }
+}
 
 # Predefined Make.com webhook URL
 MAKE_WEBHOOK_URL = "https://hook.us2.make.com/jt9nict16gd1p893oklj5ej54hnwk824"
@@ -40,7 +70,8 @@ def search():
     try:
         data = request.json
         query = data.get('query')
-        logger.info(f"Received search query: {query}")
+        model_type = data.get('model', 'pro')  # Default to pro if not specified
+        logger.info(f"Received search query: {query} with model: {model_type}")
         
         if not query:
             return jsonify({"error": "Query is required"}), 400
@@ -51,50 +82,87 @@ def search():
             "Content-Type": "application/json"
         }
         
+        # Get model configuration
+        model_config = MODELS.get(model_type, MODELS['pro'])
+        
+        # Set system prompt based on model type
+        system_prompt = model_config.get('system_prompt', "You are a helpful search assistant. Provide information in plain text only. Use simple paragraphs. For bullet points, use a simple dash and space. For section titles, write them in plain text followed by a colon.")
+        
         payload = {
-            "model": "sonar",
+            "model": model_config['name'],
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a helpful search assistant. Provide information in plain text only. Use simple paragraphs. For bullet points, use a simple dash and space. For section titles, write them in plain text followed by a colon."
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
                     "content": query
                 }
             ],
+            "max_tokens": model_config['max_tokens'],
             "temperature": 0.2,
-            "top_p": 0.9
+            "top_p": 0.9,
+            "stream": True  # Enable streaming
         }
 
         logger.debug(f"Sending request to Perplexity API with payload: {payload}")
-        response = requests.post(PERPLEXITY_URL, headers=headers, json=payload)
         
-        # Log the response for debugging
-        logger.debug(f"Perplexity API response status: {response.status_code}")
-        logger.debug(f"Perplexity API response: {response.text}")
+        def generate():
+            try:
+                # Use session with retry logic and model-specific timeout
+                with http.post(PERPLEXITY_URL, headers=headers, json=payload, timeout=model_config['timeout'], stream=True) as response:
+                    response.raise_for_status()
+                    
+                    accumulated_text = ""
+                    citations = []
+                    
+                    for line in response.iter_lines():
+                        if line:
+                            line = line.decode('utf-8')
+                            if line.startswith('data: '):
+                                try:
+                                    json_str = line[6:]  # Remove 'data: ' prefix
+                                    if json_str.strip() == '[DONE]':
+                                        break
+                                    
+                                    chunk = json.loads(json_str)
+                                    if chunk.get('citations'):
+                                        citations = chunk['citations']
+                                    
+                                    if chunk['choices'][0].get('delta', {}).get('content'):
+                                        text_chunk = chunk['choices'][0]['delta']['content']
+                                        accumulated_text += text_chunk
+                                        
+                                        # Strip markdown from the chunk
+                                        clean_chunk = strip_markdown(text_chunk)
+                                        
+                                        yield json.dumps({
+                                            'chunk': clean_chunk,
+                                            'citations': citations if citations else []
+                                        }) + '\n'
+                                        
+                                except json.JSONDecodeError:
+                                    continue
+                    
+                    # Send final accumulated citations if any
+                    if citations:
+                        yield json.dumps({
+                            'chunk': '',
+                            'citations': citations,
+                            'done': True
+                        }) + '\n'
+                    
+            except Exception as e:
+                logger.error(f"Streaming error: {str(e)}")
+                yield json.dumps({
+                    'error': str(e)
+                }) + '\n'
+
+        return Response(generate(), mimetype='text/event-stream')
         
-        response.raise_for_status()
-        response_data = response.json()
-        
-        result = response_data['choices'][0]['message']['content']
-        # Strip any markdown formatting from the result
-        result = strip_markdown(result)
-        citations = response_data.get('citations', [])
-        
-        return jsonify({
-            "result": result,
-            "citations": citations
-        })
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error: {str(e)}")
-        return jsonify({"error": f"API request failed: {str(e)}"}), 500
-    except KeyError as e:
-        logger.error(f"Response parsing error: {str(e)}")
-        return jsonify({"error": "Invalid response format from API"}), 500
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Setup error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/send-to-make', methods=['POST'])
