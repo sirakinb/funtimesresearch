@@ -32,7 +32,7 @@ http.mount("http://", adapter)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-API_KEY = "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"
+API_KEY = "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"
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 
 # Model configurations
